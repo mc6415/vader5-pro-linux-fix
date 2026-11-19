@@ -112,16 +112,21 @@ detect_steam() {
 
 # ── Wiring mode detection ─────────────────────────────────────────────────────
 # service: override steam-launcher.service (SteamOS / Bazzite game mode)
-# desktop: override ~/.local/share/applications/steam.desktop (everywhere else)
+# desktop: override ~/.local/share/applications/steam.desktop (desktop sessions)
+#
+# Systems with both a game mode and a desktop mode (SteamOS, Bazzite, CachyOS
+# handheld) get both, otherwise Steam launched from the desktop app menu runs
+# unwrapped — with xpad unbound by the udev rule, it then sees no controller.
 
-WIRE_MODE=""
+WIRE_SERVICE=0
+WIRE_DESKTOP=0
 STEAM_DESKTOP_SRC=""
+DESKTOP_LAUNCHER=""
 
 detect_wiring_mode() {
     if systemctl --user cat steam-launcher.service &>/dev/null; then
-        WIRE_MODE=service
-        info "Wiring mode: systemd service (steam-launcher.service)"
-        return
+        WIRE_SERVICE=1
+        info "Game mode wiring: systemd service (steam-launcher.service)"
     fi
 
     for p in \
@@ -130,20 +135,35 @@ detect_wiring_mode() {
         /usr/local/share/applications/steam.desktop; do
         if [[ -f "$p" ]]; then
             STEAM_DESKTOP_SRC="$p"
-            WIRE_MODE=desktop
-            info "Wiring mode: .desktop override (source: $p)"
-            return
+            break
         fi
     done
 
-    if [[ -n "$STEAM_LAUNCHER" ]]; then
-        WIRE_MODE=desktop
+    if [[ -n "$STEAM_DESKTOP_SRC" ]]; then
+        WIRE_DESKTOP=1
+        # The desktop entry's own launcher (e.g. /usr/bin/steam), not the
+        # game-mode steam-launcher, which forces -gamepadui.
+        DESKTOP_LAUNCHER="$(awk '
+            /^\[/ { in_entry = ($0 == "[Desktop Entry]") }
+            in_entry && /^Exec=/ { sub(/^Exec=/, ""); print $1; exit }
+        ' "$STEAM_DESKTOP_SRC")"
+        if [[ "$DESKTOP_LAUNCHER" != /* ]]; then
+            DESKTOP_LAUNCHER="$(command -v "$DESKTOP_LAUNCHER" 2>/dev/null || true)"
+        fi
+        info "Desktop wiring: .desktop override (source: $STEAM_DESKTOP_SRC)"
+    elif [[ $WIRE_SERVICE -eq 0 && -n "$STEAM_LAUNCHER" ]]; then
+        WIRE_DESKTOP=1
         warn "No system steam.desktop found; will create a minimal one"
-        return
     fi
 
-    err "Cannot determine how to wire Steam. Report this at the project repo."
-    exit 1
+    if [[ -z "$DESKTOP_LAUNCHER" || ! -x "$DESKTOP_LAUNCHER" ]]; then
+        DESKTOP_LAUNCHER="$STEAM_LAUNCHER"
+    fi
+
+    if [[ $WIRE_SERVICE -eq 0 && $WIRE_DESKTOP -eq 0 ]]; then
+        err "Cannot determine how to wire Steam. Report this at the project repo."
+        exit 1
+    fi
 }
 
 # ── Prerequisites check ───────────────────────────────────────────────────────
@@ -335,12 +355,15 @@ EOF
 
 wire_desktop() {
     local dst="$HOME/.local/share/applications/steam.desktop"
+    local exec_prefix="env VADER5_STEAM_LAUNCHER=$DESKTOP_LAUNCHER $WRAPPER_DST"
     mkdir -p "$(dirname "$dst")"
 
     if [[ -n "$STEAM_DESKTOP_SRC" ]]; then
-        awk -v wrapper="$WRAPPER_DST" '
-            /^\[/ { in_entry = ($0 == "[Desktop Entry]") }
-            in_entry && /^Exec=/ { print "Exec=" wrapper " %U"; next }
+        # Route every Exec= line (main entry and Store/Library/... actions)
+        # through the wrapper, keeping each line's own arguments. Otherwise an
+        # action launched while Steam is closed starts it unwrapped.
+        awk -v prefix="$exec_prefix" '
+            /^Exec=/ { sub(/^Exec=[^ ]+/, "Exec=" prefix) }
             { print }
         ' "$STEAM_DESKTOP_SRC" > "$dst"
     else
@@ -348,7 +371,7 @@ wire_desktop() {
 [Desktop Entry]
 Name=Steam
 Comment=Application for managing and playing games on Steam
-Exec=$WRAPPER_DST %U
+Exec=$exec_prefix %U
 Icon=steam
 Terminal=false
 Type=Application
@@ -526,18 +549,31 @@ cat > "$SHIM_BUILD/sdl3_shim.c" <<'SHIM_C_EOF'
  *
  * Implementation: forward to SDL_LockJoysticks (always succeeds → return 1).
  */
+#include <stdbool.h>
+
 extern void SDL_LockJoysticks(void);
+extern bool SDL_SetError(const char *fmt, ...);
 
 int SDL_TryLockJoysticks(void)
 {
     SDL_LockJoysticks();
     return 1;
 }
+
+/* steamrt64/streaming_client (Remote Play receiver) links against this
+ * Valve-fork-only renderer call. Report failure (no HDR headroom tweak)
+ * instead of letting the binary fail to load with an undefined symbol. */
+bool SDL_SetRenderHDRHeadroom(void *renderer, float headroom)
+{
+    (void)renderer;
+    (void)headroom;
+    return SDL_SetError("SDL_SetRenderHDRHeadroom is not supported");
+}
 SHIM_C_EOF
 
 cat > "$SHIM_BUILD/sdl3_shim.map" <<'SHIM_MAP_EOF'
 SDL3_0.0.0 {
-    global: SDL_TryLockJoysticks;
+    global: SDL_TryLockJoysticks; SDL_SetRenderHDRHeadroom;
     local: *;
 };
 SHIM_MAP_EOF
@@ -579,11 +615,11 @@ SDL32="$HOME/.local/share/vader5-driver/sdl/libSDL3-32.so.0"
 SDL64="$HOME/.local/share/vader5-driver/sdl/libSDL3-64.so.0"
 SHIM32="$HOME/.local/share/vader5-driver/sdl/sdl3_shim32.so"
 SHIM64="$HOME/.local/share/vader5-driver/sdl/sdl3_shim64.so"
-STEAM32="$HOME/.local/share/Steam/ubuntu12_32/libSDL3.so.0"
-STEAM64="$HOME/.local/share/Steam/ubuntu12_64/libSDL3.so.0"
-STEAM_SHIM32="$HOME/.local/share/Steam/ubuntu12_32/sdl3_shim.so"
-STEAM_SHIM64="$HOME/.local/share/Steam/ubuntu12_64/sdl3_shim.so"
-STEAM_LAUNCHER="@@STEAM_LAUNCHER@@"
+STEAM_DIR="$HOME/.local/share/Steam"
+# The desktop entry passes its own launcher (e.g. /usr/bin/steam); game mode
+# uses the one baked in at install time.
+STEAM_LAUNCHER="${VADER5_STEAM_LAUNCHER:-@@STEAM_LAUNCHER@@}"
+unset VADER5_STEAM_LAUNCHER
 
 BWRAP="$(command -v bwrap 2>/dev/null)"
 if [[ -z "$BWRAP" ]]; then
@@ -604,6 +640,27 @@ for _f in "$SDL32" "$SDL64" "$SHIM32" "$SHIM64"; do
     fi
 done
 
+# Overlay every SDL copy Steam's client may load. Older clients load SDL from
+# ubuntu12_32 / ubuntu12_64; the 64-bit client (steamrt64/steamui.so,
+# RUNPATH=$ORIGIN) loads steamrt64/libSDL3.so.0. Only bind over copies that
+# exist so we don't leave stray files in Steam's tree. The shim is bound next
+# to each copy so RUNPATH=$ORIGIN resolves our libSDL3's NEEDED sdl3_shim.so.
+BINDS=()
+for _entry in ubuntu12_32:32 ubuntu12_64:64 steamrt64:64; do
+    _dir="$STEAM_DIR/${_entry%%:*}"
+    _bits="${_entry##*:}"
+    [[ -f "$_dir/libSDL3.so.0" ]] || continue
+    if [[ "$_bits" == 32 ]]; then
+        BINDS+=(--bind "$SDL32" "$_dir/libSDL3.so.0" --bind "$SHIM32" "$_dir/sdl3_shim.so")
+    else
+        BINDS+=(--bind "$SDL64" "$_dir/libSDL3.so.0" --bind "$SHIM64" "$_dir/sdl3_shim.so")
+    fi
+done
+
+if [[ ${#BINDS[@]} -eq 0 ]]; then
+    echo "vader5-driver wrapper: no libSDL3.so.0 found under $STEAM_DIR — launching Steam unpatched" >&2
+fi
+
 export SDL_JOYSTICK_HIDAPI=1
 unset SDL_GAMECONTROLLERCONFIG
 
@@ -611,10 +668,7 @@ exec "$BWRAP" \
     --bind / / \
     --dev-bind /dev /dev \
     --proc /proc \
-    --bind "$SDL32" "$STEAM32" \
-    --bind "$SDL64" "$STEAM64" \
-    --bind "$SHIM32" "$STEAM_SHIM32" \
-    --bind "$SHIM64" "$STEAM_SHIM64" \
+    "${BINDS[@]}" \
     -- "$STEAM_LAUNCHER" "$@"
 WRAPPER_EOF
 
@@ -625,12 +679,10 @@ chmod 755 "$WRAPPER_DST"
 ok "Wrapper deployed: $WRAPPER_DST"
 
 # ── 7. Wire Steam ─────────────────────────────────────────────────────────────
-info "Wiring Steam (mode: $WIRE_MODE)"
+info "Wiring Steam"
 
-case "$WIRE_MODE" in
-    service) wire_service ;;
-    desktop) wire_desktop ;;
-esac
+[[ $WIRE_SERVICE -eq 1 ]] && wire_service
+[[ $WIRE_DESKTOP -eq 1 ]] && wire_desktop
 
 # ── 8. Udev rule ──────────────────────────────────────────────────────────────
 info "Installing udev rule"
@@ -648,15 +700,15 @@ sudo udevadm trigger
 ok "Udev rule installed"
 
 # ── 9. Restart Steam ──────────────────────────────────────────────────────────
-if [[ "$WIRE_MODE" == "service" ]] \
+if [[ $WIRE_SERVICE -eq 1 ]] \
         && systemctl --user is-active steam-launcher.service &>/dev/null; then
     info "Restarting steam-launcher.service"
     systemctl --user restart steam-launcher.service
     ok "Steam restarted"
-elif [[ "$WIRE_MODE" == "service" ]]; then
-    warn "steam-launcher.service is not running — start Steam to apply the override"
-else
+elif [[ $WIRE_DESKTOP -eq 1 ]]; then
     warn "Close and reopen Steam from your app menu for the .desktop override to take effect"
+else
+    warn "steam-launcher.service is not running — start Steam to apply the override"
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
@@ -666,12 +718,13 @@ echo ""
 echo "  Patched SDL:  $SDL_DEPLOY_DIR/"
 echo "  Wrapper:      $WRAPPER_DST"
 echo "  Udev rule:    $UDEV_RULE_DST"
-case "$WIRE_MODE" in
-    service) echo "  Systemd:      $HOME/.config/systemd/user/steam-launcher.service.d/override.conf" ;;
-    desktop) echo "  Desktop:      $HOME/.local/share/applications/steam.desktop" ;;
-esac
+[[ $WIRE_SERVICE -eq 1 ]] && echo "  Systemd:      $HOME/.config/systemd/user/steam-launcher.service.d/override.conf"
+[[ $WIRE_DESKTOP -eq 1 ]] && echo "  Desktop:      $HOME/.local/share/applications/steam.desktop"
 echo ""
 echo "Next steps:"
+echo "  0. In the Flydigi Space Station app, enable 'Allow third-party apps to"
+echo "     take over mappings'. Without it SDL deliberately hides the controller,"
+echo "     and with xpad unbound Steam will show no controller at all."
 echo "  1. Replug the Vader 5 Pro (or reconnect the 2.4G dongle) so the new"
 echo "     udev rule fires and unbinds xpad from interface 0."
 echo "  2. In Steam: Settings → Controller → Detected Controllers."
